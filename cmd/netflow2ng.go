@@ -53,10 +53,11 @@ func (a *Address) Value() (string, int) {
 }
 
 type CLI struct {
-	Listen Address `kong:"short='a',help='NetFlow/IPFIX listen address:port',default='0.0.0.0:2055'"`
-	Reuse  bool    `kong:"help='Enable SO_REUSEPORT for NetFlow/IPFIX listen port'"`
-
-	Metrics Address `kong:"short='m',help='Metrics listen address',default='0.0.0.0:8080'"`
+	Listen      Address `kong:"short='a',help='NetFlow/IPFIX listen address:port',default='0.0.0.0:2055'"`
+	SFlowListen Address `kong:"short='A',help='sFlow listen address:port',default='0.0.0.0:6343'"`
+	Reuse       bool    `kong:"help='Enable SO_REUSEPORT for NetFlow/IPFIX listen port'"`
+	SFlow       bool    `kong:"short='s',help='Use sFlow'"`
+	Metrics     Address `kong:"short='m',help='Metrics listen address',default='0.0.0.0:8080'"`
 
 	ListenZmq string   `kong:"short='z',help='proto://IP:Port to listen on for ZMQ connections',default='tcp://*:5556'"`
 	Topic     string   `kong:"help='ZMQ Topic',default='flow'"`
@@ -88,7 +89,7 @@ func main() {
 	parser := kong.Must(
 		&rctx.cli,
 		kong.Name("netflow2ng"),
-		kong.Description("NetFlow v9/IPFIX Proxy for ntopng"),
+		kong.Description("NetFlowv9/IPFIX/sFlow Proxy for ntopng"),
 		kong.UsageOnError(),
 	)
 
@@ -117,27 +118,54 @@ func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	log.Info("Starting netflow2ng")
+	var s_netflow *utils.StateNetFlow
+	var s_sflow *utils.StateSFlow
+	if rctx.cli.SFlow {
+		s_sflow = &utils.StateSFlow{
+			Transport: defaultTransport,
+			Logger:    log,
+		}
+	} else {
+		s_netflow = &utils.StateNetFlow{
+			Transport: defaultTransport,
+			Logger:    log,
+		}
+	}
+	if rctx.cli.SFlow {
+		if s_sflow.Transport, err = StartZmqProducer(); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		go httpServer(s_netflow, string(rctx.cli.Metrics))
 
-	s := &utils.StateNetFlow{
-		Transport: defaultTransport,
-		Logger:    log,
+		if s_netflow.Transport, err = StartZmqProducer(); err != nil {
+			log.Fatal(err)
+		}
 	}
 
-	go httpServer(s, string(rctx.cli.Metrics))
-
-	if s.Transport, err = StartZmqProducer(); err != nil {
-		log.Fatal(err)
+	var ip string
+	var port int
+	if rctx.cli.SFlow {
+		ip, port = rctx.cli.SFlowListen.Value()
+		log.WithFields(logrus.Fields{
+			"Type": "sFlow"}).
+			Infof("Listening on UDP %s", rctx.cli.SFlowListen)
+	} else {
+		ip, port = rctx.cli.Listen.Value()
+		log.WithFields(logrus.Fields{
+			"Type": "NetFlow"}).
+			Infof("Listening on UDP %s", rctx.cli.Listen)
+	}
+	if rctx.cli.SFlow {
+		if err = s_sflow.FlowRoutine(rctx.cli.Workers, ip, port, rctx.cli.Reuse); err != nil {
+			log.Fatalf("Fatal error: could not listen to UDP (%v)", err)
+		}
+	} else {
+		if err = s_netflow.FlowRoutine(rctx.cli.Workers, ip, port, rctx.cli.Reuse); err != nil {
+			log.Fatalf("Fatal error: could not listen to UDP (%v)", err)
+		}
 	}
 
-	ip, port := rctx.cli.Listen.Value()
-
-	log.WithFields(logrus.Fields{
-		"Type": "NetFlow"}).
-		Infof("Listening on UDP %s", rctx.cli.Listen)
-
-	if err = s.FlowRoutine(rctx.cli.Workers, ip, port, rctx.cli.Reuse); err != nil {
-		log.Fatalf("Fatal error: could not listen to UDP (%v)", err)
-	}
 }
 
 func PrintVersion() {

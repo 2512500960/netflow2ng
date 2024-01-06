@@ -23,6 +23,7 @@ import (
 
 	"github.com/cloudflare/goflow/v3/decoders/netflow"
 	flowmessage "github.com/cloudflare/goflow/v3/pb"
+
 	// nolint SA1019 the new google.golang.org/protobuf/proto package is not backwards compatible
 	"github.com/golang/protobuf/proto"
 	zmq "github.com/pebbe/zmq4"
@@ -147,7 +148,9 @@ func (zs *ZmqState) toJSON(flowMessage *flowmessage.FlowMessage) ([]byte, error)
 	_hwaddr := make([]byte, binary.MaxVarintLen64)
 	var icmp_type uint16
 	retmap := make(map[string]interface{})
-
+	if flowMessage.Type == flowmessage.FlowMessage_SFLOW_5 {
+		log.Debug("sFlow message recevied!")
+	}
 	// Stats + direction
 	if flowMessage.FlowDirection == 0 {
 		// ingress == 0
