@@ -148,20 +148,26 @@ func (zs *ZmqState) toJSON(flowMessage *flowmessage.FlowMessage) ([]byte, error)
 	_hwaddr := make([]byte, binary.MaxVarintLen64)
 	var icmp_type uint16
 	retmap := make(map[string]interface{})
+	SamplingRate := uint64(1)
 	if flowMessage.Type == flowmessage.FlowMessage_SFLOW_5 {
+		SamplingRate = flowMessage.SamplingRate
 		log.Debug("sFlow message recevied!")
+		log.Debugf("flowMessage.SamplingRate is %d", flowMessage.SamplingRate)
+		log.Debugf("flowMessage.Bytes is %d", flowMessage.Bytes)
+		log.Debugf("flowMessage.Packets is %d", flowMessage.Packets)
 	}
 	// Stats + direction
+
 	if flowMessage.FlowDirection == 0 {
 		// ingress == 0
 		retmap[strconv.Itoa(netflow.NFV9_FIELD_DIRECTION)] = 0
-		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_BYTES)] = flowMessage.Bytes
-		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_PKTS)] = flowMessage.Packets
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_BYTES)] = flowMessage.Bytes * SamplingRate
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_PKTS)] = flowMessage.Packets * SamplingRate
 	} else {
 		// egress == 1
 		retmap[strconv.Itoa(netflow.NFV9_FIELD_DIRECTION)] = 1
-		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_BYTES)] = flowMessage.Bytes
-		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_PKTS)] = flowMessage.Packets
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_BYTES)] = flowMessage.Bytes * SamplingRate
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_PKTS)] = flowMessage.Packets * SamplingRate
 	}
 	retmap[strconv.Itoa(netflow.NFV9_FIELD_FIRST_SWITCHED)] = flowMessage.TimeFlowStart
 	retmap[strconv.Itoa(netflow.NFV9_FIELD_LAST_SWITCHED)] = flowMessage.TimeFlowEnd
