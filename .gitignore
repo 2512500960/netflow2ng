@@ -1,6 +1,8 @@
 .*.sw?
 dist/
-
+goflow/
+.vscode/
+.github/
 # Binaries for programs and plugins
 *.exe
 *.exe~
