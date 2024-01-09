@@ -14,14 +14,13 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"strconv"
 	"time"
 
-	"github.com/cloudflare/goflow/v3/decoders/netflow"
+	"github.com/cloudflare/goflow/decoders/netflow"
 	flowmessage "github.com/cloudflare/goflow/v3/pb"
 
 	// nolint SA1019 the new google.golang.org/protobuf/proto package is not backwards compatible
@@ -30,11 +29,12 @@ import (
 )
 
 type ZmqState struct {
-	context   *zmq.Context
-	publisher *zmq.Socket
-	source_id int
-	serialize string
-	compress  bool
+	context        *zmq.Context
+	publisher      *zmq.Socket
+	source_id      int
+	serialize      string
+	compress       bool
+	msg_send_count uint32
 }
 
 func StartZmqProducer() (*ZmqState, error) {
@@ -54,11 +54,12 @@ func StartZmqProducer() (*ZmqState, error) {
 	//  Ensure subscriber connection has time to complete
 	time.Sleep(time.Second)
 	return &ZmqState{
-		context:   context,
-		publisher: publisher,
-		source_id: int(rctx.cli.SourceId),
-		serialize: serialize,
-		compress:  rctx.cli.Compress,
+		context:        context,
+		publisher:      publisher,
+		source_id:      int(rctx.cli.SourceId),
+		serialize:      serialize,
+		compress:       rctx.cli.Compress,
+		msg_send_count: 0,
 	}, nil
 }
 
@@ -138,36 +139,198 @@ func (zh *ZmqHeader) Bytes() ([]byte, error) {
 	return bBuf.Bytes(), nil
 }
 
+func (zs *ZmqState) SFlowCountertoJSON(flowMessage *flowmessage.FlowMessage) ([]byte, error) {
+
+	retmap := make(map[string]interface{})
+	var u32agentip uint32 = 0
+	u32agentip = binary.BigEndian.Uint32(flowMessage.SamplerAddress)
+	retmap[strconv.Itoa(SFLOW_DEVICE_IP)] = u32agentip
+	retmap[strconv.Itoa(SFLOW_IF_INDEX)] = flowMessage.IfIndex
+	//retmap[strconv.Itoa(SFLOW_IF_NAME )] = flowMessage.IfName
+	retmap[strconv.Itoa(SFLOW_IF_TYPE)] = flowMessage.IfType
+	retmap[strconv.Itoa(SFLOW_IF_SPEED)] = flowMessage.IfSpeed
+	retmap[strconv.Itoa(SFLOW_IF_DIRECTION)] = flowMessage.IfDirection
+	if flowMessage.IfStatus&1 == 1 {
+		retmap[strconv.Itoa(SFLOW_IF_ADMIN_STATUS)] = "Up"
+	} else {
+		retmap[strconv.Itoa(SFLOW_IF_ADMIN_STATUS)] = "Down"
+	}
+	if flowMessage.IfStatus&2 == 2 {
+		retmap[strconv.Itoa(SFLOW_IF_OPER_STATUS)] = "Up"
+	} else {
+		retmap[strconv.Itoa(SFLOW_IF_OPER_STATUS)] = "Down"
+	}
+	//retmap[strconv.Itoa(SFLOW_IF_ADMIN_STATUS)] = flowMessage.IfStatus
+	//retmap[strconv.Itoa(SFLOW_IF_OPER_STATUS)] = flowMessage.ForwardingStatus
+	retmap[strconv.Itoa(SFLOW_IF_IN_PACKETS)] = flowMessage.IfInUcastPkts
+	retmap[strconv.Itoa(SFLOW_IF_IN_OCTETS)] = flowMessage.IfInOctets
+	retmap[strconv.Itoa(SFLOW_IF_IN_ERRORS)] = flowMessage.IfInErrors
+	retmap[strconv.Itoa(SFLOW_IF_OUT_OCTETS)] = flowMessage.IfOutOctets
+	retmap[strconv.Itoa(SFLOW_IF_OUT_PACKETS)] = flowMessage.IfOutUcastPkts
+	retmap[strconv.Itoa(SFLOW_IF_OUT_ERRORS)] = flowMessage.IfOutErrors
+	retmap[strconv.Itoa(SFLOW_IF_PROMISCUOUS_MODE)] = flowMessage.IfPromiscuousMode
+	// convert to JSON
+	jdata, err := json.Marshal(retmap)
+	if err != nil {
+		return jdata, err
+	}
+	if zs.compress {
+		var zbuf bytes.Buffer
+		z := zlib.NewWriter(&zbuf)
+		if _, err = z.Write(jdata); err != nil {
+			return []byte{}, err
+		}
+		if err = z.Close(); err != nil {
+			return []byte{}, err
+		}
+		// must set jdata[0] = '\0' to indicate compressed data
+		jdata = nil // zero current buffer
+		jdata = append(jdata, 0)
+		jdata = append(jdata, zbuf.Bytes()...)
+	}
+	return jdata, nil
+}
+
 /*
- * Converts a FlowMessage to JSON for ntopng
+ * Converts a sflow FlowMessage traffic sample to JSON for ntopng
  */
-func (zs *ZmqState) toJSON(flowMessage *flowmessage.FlowMessage) ([]byte, error) {
+func (zs *ZmqState) SFlowSampletoJSON(flowMessage *flowmessage.FlowMessage) ([]byte, error) {
 	ip6 := make(net.IP, net.IPv6len)
 	ip4 := make(net.IP, net.IPv4len)
 	hwaddr := make(net.HardwareAddr, 6)
 	_hwaddr := make([]byte, binary.MaxVarintLen64)
 	var icmp_type uint16
 	retmap := make(map[string]interface{})
-	SamplingRate := uint64(1)
-	if flowMessage.Type == flowmessage.FlowMessage_SFLOW_5 {
-		SamplingRate = flowMessage.SamplingRate
-		log.Debug("sFlow message recevied!")
-		log.Debugf("flowMessage.SamplingRate is %d", flowMessage.SamplingRate)
-		log.Debugf("flowMessage.Bytes is %d", flowMessage.Bytes)
-		log.Debugf("flowMessage.Packets is %d", flowMessage.Packets)
+	retmap[strconv.Itoa(SFLOW_IF_SAMPLING_INTERVAL)] = 1
+	if flowMessage.FlowDirection == 0 {
+		// ingress == 0
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_DIRECTION)] = 0
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_BYTES)] = flowMessage.Bytes * flowMessage.SamplingRate
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_PKTS)] = flowMessage.Packets * flowMessage.SamplingRate
+	} else {
+		// egress == 1
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_DIRECTION)] = 1
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_BYTES)] = flowMessage.Bytes * flowMessage.SamplingRate
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_PKTS)] = flowMessage.Packets * flowMessage.SamplingRate
 	}
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_FIRST_SWITCHED)] = flowMessage.TimeFlowStart
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_LAST_SWITCHED)] = flowMessage.TimeFlowEnd
+
+	// L4
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_PROTOCOL)] = flowMessage.Proto
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_L4_SRC_PORT)] = flowMessage.SrcPort
+	retmap[strconv.Itoa(SFLOW_FIELD_L4_DST_PORT)] = flowMessage.DstPort
+
+	// Interfaces
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_INPUT_SNMP)] = flowMessage.InIf
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_OUTPUT_SNMP)] = flowMessage.OutIf
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_TCP_FLAGS)] = flowMessage.TCPFlags
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_MIN_TTL)] = flowMessage.IPTTL
+
+	// IP
+	if flowMessage.Etype == 0x800 {
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IP_PROTOCOL_VERSION)] = 4
+		// IPv4
+		copy(ip4, flowMessage.SrcAddr)
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV4_SRC_ADDR)] = ip4.String()
+		copy(ip4, flowMessage.DstAddr)
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV4_DST_ADDR)] = ip4.String()
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV4_SRC_PREFIX)] = flowMessage.SrcNet
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV4_DST_PREFIX)] = flowMessage.DstNet
+		copy(ip4, flowMessage.NextHop)
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV4_NEXT_HOP)] = ip4.String()
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV4_IDENT)] = flowMessage.FragmentId
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_FRAGMENT_OFFSET)] = flowMessage.FragmentOffset
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV6_SRC_MASK)] = flowMessage.SrcNet
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV6_DST_MASK)] = flowMessage.DstNet
+	} else {
+		// 0x86dd IPv6
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IP_PROTOCOL_VERSION)] = 6
+		copy(ip6, flowMessage.SrcAddr)
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV6_SRC_ADDR)] = ip6.String()
+		copy(ip6, flowMessage.DstAddr)
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV6_DST_ADDR)] = ip6.String()
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV6_SRC_MASK)] = flowMessage.SrcNet
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV6_DST_MASK)] = flowMessage.DstNet
+		copy(ip6, flowMessage.NextHop)
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV6_NEXT_HOP)] = ip6.String()
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IPV6_FLOW_LABEL)] = flowMessage.IPv6FlowLabel
+	}
+
+	// ICMP
+	icmp_type = uint16((uint16(flowMessage.IcmpType) << 8) + uint16(flowMessage.IcmpCode))
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_ICMP_TYPE)] = icmp_type
+
+	// MAC
+	binary.PutUvarint(_hwaddr, flowMessage.DstMac)
+	for i := 0; i < 6; i++ {
+		hwaddr[i] = _hwaddr[i]
+	}
+	retmap[strconv.Itoa(SFLOW_FIELD_IN_SRC_MAC)] = hwaddr.String()
+	binary.PutUvarint(_hwaddr, flowMessage.SrcMac)
+	for i := 0; i < 6; i++ {
+		hwaddr[i] = _hwaddr[i]
+	}
+	retmap[strconv.Itoa(SFLOW_FIELD_OUT_DST_MAC)] = hwaddr.String()
+
+	// VLAN
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_SRC_VLAN)] = flowMessage.SrcVlan
+	retmap[strconv.Itoa(netflow.NFV9_FIELD_DST_VLAN)] = flowMessage.DstVlan
+
+	// Flow Exporter IP
+	if len(flowMessage.SamplerAddress) == 4 {
+		copy(ip4, flowMessage.SamplerAddress)
+		retmap[strconv.Itoa(netflow.IPFIX_FIELD_exporterIPv4Address)] = ip4.String()
+	} else if len(flowMessage.SamplerAddress) == 16 {
+		copy(ip6, flowMessage.SamplerAddress)
+		retmap[strconv.Itoa(netflow.IPFIX_FIELD_exporterIPv6Address)] = ip6.String()
+	}
+
+	// convert to JSON
+	jdata, err := json.Marshal(retmap)
+	if err != nil {
+		return jdata, err
+	}
+
+	if zs.compress {
+		var zbuf bytes.Buffer
+		z := zlib.NewWriter(&zbuf)
+		if _, err = z.Write(jdata); err != nil {
+			return []byte{}, err
+		}
+		if err = z.Close(); err != nil {
+			return []byte{}, err
+		}
+		// must set jdata[0] = '\0' to indicate compressed data
+		jdata = nil // zero current buffer
+		jdata = append(jdata, 0)
+		jdata = append(jdata, zbuf.Bytes()...)
+	}
+	return jdata, nil
+}
+
+/*
+ * Converts a netflow FlowMessage to JSON for ntopng
+ */
+func (zs *ZmqState) NetFlowtoJSON(flowMessage *flowmessage.FlowMessage) ([]byte, error) {
+	ip6 := make(net.IP, net.IPv6len)
+	ip4 := make(net.IP, net.IPv4len)
+	hwaddr := make(net.HardwareAddr, 6)
+	_hwaddr := make([]byte, binary.MaxVarintLen64)
+	var icmp_type uint16
+	retmap := make(map[string]interface{})
 	// Stats + direction
 
 	if flowMessage.FlowDirection == 0 {
 		// ingress == 0
 		retmap[strconv.Itoa(netflow.NFV9_FIELD_DIRECTION)] = 0
-		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_BYTES)] = flowMessage.Bytes * SamplingRate
-		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_PKTS)] = flowMessage.Packets * SamplingRate
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_BYTES)] = flowMessage.Bytes
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_IN_PKTS)] = flowMessage.Packets
 	} else {
 		// egress == 1
 		retmap[strconv.Itoa(netflow.NFV9_FIELD_DIRECTION)] = 1
-		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_BYTES)] = flowMessage.Bytes * SamplingRate
-		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_PKTS)] = flowMessage.Packets * SamplingRate
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_BYTES)] = flowMessage.Bytes
+		retmap[strconv.Itoa(netflow.NFV9_FIELD_OUT_PKTS)] = flowMessage.Packets
 	}
 	retmap[strconv.Itoa(netflow.NFV9_FIELD_FIRST_SWITCHED)] = flowMessage.TimeFlowStart
 	retmap[strconv.Itoa(netflow.NFV9_FIELD_LAST_SWITCHED)] = flowMessage.TimeFlowEnd
@@ -273,18 +436,34 @@ func (zs *ZmqState) toJSON(flowMessage *flowmessage.FlowMessage) ([]byte, error)
 
 func (zs *ZmqState) Publish(msgs []*flowmessage.FlowMessage) {
 	for _, msg := range msgs {
-		zs.SendZmqMessage(msg)
+		if msg.IsIfCounters {
+			zs.SendZmqMessage(msg, msg.IsIfCounters)
+		}
+		if msg.IsFlowSample {
+			zs.SendZmqMessage(msg, false)
+		}
 	}
 }
 
-func (zs *ZmqState) SendZmqMessage(flowMessage *flowmessage.FlowMessage) {
+func (zs *ZmqState) SendZmqMessage(flowMessage *flowmessage.FlowMessage, ifCounter bool) {
 	var msg []byte
 	var err error
 
 	if zs.serialize == "pbuf" {
 		msg, err = proto.Marshal(flowMessage)
 	} else {
-		msg, err = zs.toJSON(flowMessage)
+		if flowMessage.Type == flowmessage.FlowMessage_SFLOW_5 {
+			if !ifCounter {
+				msg, err = zs.SFlowSampletoJSON(flowMessage)
+			}
+			if ifCounter {
+				log.Debug("sflow IFcounter message recevied!")
+				msg, err = zs.SFlowCountertoJSON(flowMessage)
+			}
+
+		} else {
+			msg, err = zs.NetFlowtoJSON(flowMessage)
+		}
 	}
 
 	if err != nil {
@@ -294,6 +473,9 @@ func (zs *ZmqState) SendZmqMessage(flowMessage *flowmessage.FlowMessage) {
 	msg_len := uint16(len(msg))
 
 	header := zs.NewZmqHeader(msg_len)
+	if ifCounter {
+		header.url = "counter"
+	}
 
 	// send our header with the topic first as a multi-part message
 	hbytes, err := header.Bytes()
@@ -317,14 +499,22 @@ func (zs *ZmqState) SendZmqMessage(flowMessage *flowmessage.FlowMessage) {
 		log.Error(err)
 		return
 	}
-
+	if zs.msg_send_count%15 == 0 {
+		header = zs.NewZmqHeader(msg_len)
+		header.url = "template"
+		hbytes, _ = header.Bytes()
+		zs.publisher.SendBytes(hbytes, zmq.SNDMORE)
+		zs.publisher.Send(getTemplateString(), 0)
+		log.Debugf("sending template %s", getTemplateString())
+		zs.msg_send_count = zs.msg_send_count + 1
+	}
 	if zs.serialize == "json" {
 		if zs.compress {
-			log.Debugf("sent %d bytes of zlib json:\n%s", msg_len, hex.Dump(msg))
+			//log.Debugf("sent %d bytes of zlib json:\n%s", msg_len, hex.Dump(msg))
 		} else {
 			log.Debugf("sent %d bytes of json: %s", msg_len, string(msg))
 		}
 	} else {
-		log.Debugf("sent %d bytes of pbuf:\n%s", msg_len, hex.Dump(msg))
+		//log.Debugf("sent %d bytes of pbuf:\n%s", msg_len, hex.Dump(msg))
 	}
 }
